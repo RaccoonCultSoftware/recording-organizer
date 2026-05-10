@@ -6,6 +6,8 @@ obs = obslua
 -- Global variables
 recordings_base_folder = ""
 selected_source_name = ""
+strict_ascii = false
+executable_append_format = ""
 recording_segments = {}  -- Track all segments from current recording session
 recording_base_path = ""  -- Base path to monitor for new segments
 
@@ -73,20 +75,77 @@ function script_properties()
         "Select which Window/Game Capture source to use for naming folders. Auto-detect uses the first capture source found.",
         obs.OBS_TEXT_INFO
     )
-    
+
+    -- Add dropdown for stripping non-ASCII characters from folder names
+    local ascii_mode = obs.obs_properties_add_list(
+        props,
+        "strict_ascii",
+        "Use ASCII-only folder names",
+        obs.OBS_COMBO_TYPE_LIST,
+        obs.OBS_COMBO_FORMAT_INT
+    )
+    obs.obs_property_list_add_int(ascii_mode, "Off", 0)
+    obs.obs_property_list_add_int(ascii_mode, "On", 1)
+
+    -- Add informational text for ASCII-only setting
+    obs.obs_properties_add_text(
+        props,
+        "strict_ascii_info",
+        "If enabled, strips accented and special characters (e.g. TM, R, C, e-acute) from folder names. Useful on Windows where these can be an issue, or for cross-platform portability.",
+        obs.OBS_TEXT_INFO
+    )
+
+    -- Add dropdown for appending the executable name to the folder
+    local exe_format = obs.obs_properties_add_list(
+        props,
+        "executable_append_format",
+        "Append executable name to folder",
+        obs.OBS_COMBO_TYPE_LIST,
+        obs.OBS_COMBO_FORMAT_STRING
+    )
+    obs.obs_property_list_add_string(exe_format, "Off", "")
+    obs.obs_property_list_add_string(exe_format, " (name)", " (%s)")
+    obs.obs_property_list_add_string(exe_format, "_name", "_%s")
+    obs.obs_property_list_add_string(exe_format, " - name", " - %s")
+
+    -- Disable the dropdown on non-Windows platforms - executable name extraction
+    -- is only meaningful for Windows Window/Game Capture sources
+    local is_windows = package.config:sub(1,1) == "\\"
+    if not is_windows then
+        obs.obs_property_set_enabled(exe_format, false)
+    end
+
+    -- Add informational text for the executable-append dropdown
+    local exe_info_text
+    if is_windows then
+        exe_info_text = "Appends the source's executable name (e.g. 'bf6' from 'bf6.exe') to the folder name. Only fires when the OBS source provides one; silently does nothing for sources that don't."
+    else
+        exe_info_text = "(Only available on Windows.) OBS doesn't expose an equivalent executable name for capture sources on this platform."
+    end
+    obs.obs_properties_add_text(
+        props,
+        "executable_append_info",
+        exe_info_text,
+        obs.OBS_TEXT_INFO
+    )
+
     return props
 end
 
 function script_update(settings)
     -- Get the base folder from settings
     recordings_base_folder = obs.obs_data_get_string(settings, "base_folder")
-    
+
     -- Get the selected capture source
     selected_source_name = obs.obs_data_get_string(settings, "selected_source")
-    
+
+    -- Get the sanitization options
+    strict_ascii = obs.obs_data_get_int(settings, "strict_ascii") == 1
+    executable_append_format = obs.obs_data_get_string(settings, "executable_append_format")
+
     obs.script_log(obs.LOG_INFO, string.format(
-        "Settings updated - Base folder: '%s', Selected source: '%s'",
-        recordings_base_folder, selected_source_name
+        "Settings updated - Base folder: '%s', Selected source: '%s', Strict ASCII: %s, Append format: '%s'",
+        recordings_base_folder, selected_source_name, tostring(strict_ascii), executable_append_format
     ))
 end
 
@@ -237,124 +296,141 @@ function get_active_window_name()
     end
     
     local window_name = nil
-    
+    local exe_name = nil
+
     -- Try to find window capture or game capture sources
     -- If user selected a specific source, use that; otherwise auto-detect
     if selected_source_name and selected_source_name ~= "" then
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Using selected source: " .. selected_source_name)
-        window_name = find_specific_capture_source(scene, selected_source_name)
+        window_name, exe_name = find_specific_capture_source(scene, selected_source_name)
     else
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Auto-detecting capture source")
-        window_name = find_capture_source_name(scene)
+        window_name, exe_name = find_capture_source_name(scene)
     end
-    
+
     -- Release the scene source
     obs.obs_source_release(scene_source)
-    
+
     if window_name and window_name ~= "" then
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Raw window name before sanitization: '" .. window_name .. "'")
         -- Clean the name to be folder-safe
-        return sanitize_folder_name(window_name)
+        local sanitized = sanitize_folder_name(window_name)
+
+        -- Optionally append the executable name (Windows captures only)
+        if executable_append_format and executable_append_format ~= "" and exe_name and exe_name ~= "" then
+            local exe_clean = clean_exe(exe_name)
+            if exe_clean ~= "" then
+                local appended = sanitized .. string.format(executable_append_format, exe_clean)
+                obs.script_log(obs.LOG_INFO, "Recording Organizer: Appended executable name: '" .. appended .. "'")
+                return appended
+            end
+        end
+
+        return sanitized
     end
-    
+
     obs.script_log(obs.LOG_WARNING, "Recording Organizer: No window name found, returning Unknown")
     return "Unknown"
 end
 
 function find_specific_capture_source(scene, source_name)
     local window_name = nil
-    
+    local exe_name = nil
+
     local function enum_item(scene, item)
         local source = obs.obs_sceneitem_get_source(item)
-        
+
         if not source then
             return true -- Continue iteration
         end
-        
+
         local current_source_name = obs.obs_source_get_name(source)
-        
+
         if current_source_name == source_name then
             local source_id = obs.obs_source_get_id(source)
-            
+
             if source_id == "window_capture" or source_id == "game_capture" or source_id == "xcomposite_input" or source_id == "screen_capture" then
                 local settings = obs.obs_source_get_settings(source)
-                window_name = extract_window_info_from_settings(source_id, settings, source)
+                window_name, exe_name = extract_window_info_from_settings(source_id, settings, source)
                 obs.obs_data_release(settings)
-                
+
                 if window_name then
                     return false -- Stop iteration
                 end
             end
         end
-        
+
         return true -- Continue iteration
     end
-    
+
     obs.obs_scene_enum_items(scene, enum_item)
-    
-    return window_name
+
+    return window_name, exe_name
 end
 
 function find_capture_source_name(scene)
     local window_name = nil
+    local exe_name = nil
     local found_sources = 0
-    
+
     obs.script_log(obs.LOG_INFO, "Recording Organizer: Enumerating ALL sources globally...")
-    
+
     -- Get all sources in OBS (not just scene items)
     local sources = obs.obs_enum_sources()
-    
+
     if not sources then
         obs.script_log(obs.LOG_ERROR, "Recording Organizer: Failed to enumerate sources!")
-        return nil
+        return nil, nil
     end
-    
+
     obs.script_log(obs.LOG_INFO, "Recording Organizer: Total sources available: " .. #sources)
-    
+
     for i, source in ipairs(sources) do
         local source_id = obs.obs_source_get_id(source)
         local source_name = obs.obs_source_get_name(source)
-        
+
         obs.script_log(obs.LOG_INFO, string.format("Recording Organizer: Source #%d: '%s' (type: %s)", i, source_name, source_id))
-        
+
         if source_id == "window_capture" or source_id == "game_capture" or source_id == "xcomposite_input" or source_id == "screen_capture" then
             found_sources = found_sources + 1
             obs.script_log(obs.LOG_INFO, "Recording Organizer: Found capture source! Extracting window info...")
-            
+
             local settings = obs.obs_source_get_settings(source)
-            window_name = extract_window_info_from_settings(source_id, settings, source)
+            window_name, exe_name = extract_window_info_from_settings(source_id, settings, source)
             obs.obs_data_release(settings)
-            
+
             if window_name then
                 obs.script_log(obs.LOG_INFO, "Recording Organizer: SUCCESS! Found window name: '" .. window_name .. "'")
                 obs.source_list_release(sources)
-                return window_name
+                return window_name, exe_name
             end
         end
     end
-    
+
     obs.source_list_release(sources)
-    
+
     obs.script_log(obs.LOG_INFO, "Recording Organizer: Enumeration complete. Capture sources found: " .. found_sources)
-    
+
     if found_sources == 0 then
         obs.script_log(obs.LOG_WARNING, "Recording Organizer: No Window/Game Capture sources found at all!")
     end
-    
-    return window_name
+
+    return window_name, exe_name
 end
 
 function extract_window_info_from_settings(source_id, settings, source)
     local window_title = nil
-    
+    local exe_name = nil
+
     if source_id == "window_capture" then
         -- Windows: window property format is "[executable.exe]: Window Title"
         -- macOS: window property format is "Window Title" or "Application - Window Title"
         local window_str = obs.obs_data_get_string(settings, "window")
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Window Capture - raw string: '" .. tostring(window_str) .. "'")
-        
+
         if window_str and window_str ~= "" then
             window_title = extract_window_title(window_str)
+            exe_name = extract_executable_name(window_str, source_id)
             if not window_title or window_title == "" then
                 obs.script_log(obs.LOG_WARNING, "Recording Organizer: Failed to extract title from window string")
             end
@@ -367,25 +443,26 @@ function extract_window_info_from_settings(source_id, settings, source)
                 obs.script_log(obs.LOG_INFO, "Recording Organizer: Using source name as fallback: '" .. window_title .. "'")
             end
         end
-        
+
     elseif source_id == "game_capture" then
         -- Game capture: always try to get window string regardless of mode
         local mode = obs.obs_data_get_int(settings, "mode")
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Game Capture - mode: " .. tostring(mode))
-        
+
         -- Always try to get the window string (even in mode 0, it might be stored)
         local window_str = obs.obs_data_get_string(settings, "window")
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Game Capture - raw window string: '" .. tostring(window_str) .. "'")
-        
+
         if window_str and window_str ~= "" then
             window_title = extract_window_title(window_str)
+            exe_name = extract_executable_name(window_str, source_id)
             if window_title and window_title ~= "" then
                 obs.script_log(obs.LOG_INFO, "Recording Organizer: Successfully extracted from window string!")
             end
         else
             obs.script_log(obs.LOG_WARNING, "Recording Organizer: Game Capture has empty window string (mode: " .. mode .. ")")
         end
-        
+
         -- Fallback to source name ONLY if we got nothing
         if not window_title or window_title == "" then
             local source_name = obs.obs_source_get_name(source)
@@ -397,7 +474,7 @@ function extract_window_info_from_settings(source_id, settings, source)
                 obs.script_log(obs.LOG_WARNING, "Recording Organizer: No window info available and source name is default/device name")
             end
         end
-        
+
     elseif source_id == "xcomposite_input" then
         -- Linux: capture_window property
         local window_str = obs.obs_data_get_string(settings, "capture_window")
@@ -452,8 +529,8 @@ function extract_window_info_from_settings(source_id, settings, source)
     else
         obs.script_log(obs.LOG_WARNING, "Recording Organizer: Could not extract window title from settings")
     end
-    
-    return window_title
+
+    return window_title, exe_name
 end
 
 function extract_app_name_from_bundle(bundle_id)
@@ -488,8 +565,11 @@ function extract_window_title(window_string)
     
     -- Try to extract title after "]:" pattern (common Windows format)
     -- Example: "[Project_Plague-Win64-Shipping.exe]: Project_Plague"
+    -- Game Capture may append ":class:exe" segments (e.g. "[bf6.exe]: Battlefield 6:UnrealWindow:bf6")
     local title = window_string:match("%]:%s*(.+)")
     if title and title ~= "" then
+        -- Strip any trailing ":class:exe" segments
+        title = title:match("^([^:]+)") or title
         -- Trim any trailing whitespace
         title = title:match("^%s*(.-)%s*$")
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Extracted using ']:'  pattern: '" .. title .. "'")
@@ -505,7 +585,19 @@ function extract_window_title(window_string)
         return clean_exe
     end
     
-    -- Try to extract from simple colon separator ("Game: Minecraft")
+    -- Handle colon-separated formats:
+    --   OBS Game/Window Capture: "title:class:exe" (2+ colons, title comes first)
+    --   Generic "Game: Title" style (1 colon, title comes after)
+    local _, colon_count = window_string:gsub(":", "")
+    if colon_count >= 2 then
+        -- OBS "title:class:exe" format - take only the title (before first colon)
+        title = window_string:match("^([^:]+)")
+        if title and title ~= "" then
+            title = title:match("^%s*(.-)%s*$")
+            obs.script_log(obs.LOG_INFO, "Recording Organizer: Extracted using ':' pattern (title before first colon): '" .. title .. "'")
+            return title
+        end
+    end
     title = window_string:match(":%s*(.+)")
     if title and title ~= "" then
         obs.script_log(obs.LOG_INFO, "Recording Organizer: Extracted using ':' pattern: '" .. title .. "'")
@@ -524,6 +616,57 @@ function extract_window_title(window_string)
     -- Return the whole string if no pattern matched (works for macOS simple window titles)
     obs.script_log(obs.LOG_INFO, "Recording Organizer: No pattern matched, using full string: '" .. window_string .. "'")
     return window_string
+end
+
+function extract_executable_name(window_string, source_id)
+    -- Only Windows Window/Game Capture sources embed an executable name
+    if source_id ~= "window_capture" and source_id ~= "game_capture" then
+        return nil
+    end
+    if not window_string or window_string == "" then
+        return nil
+    end
+
+    -- Bracket form: "[bf6.exe]: Battlefield 6"
+    local exe = window_string:match("%[(.-%.[Ee][Xx][Ee])%]")
+    if exe and exe ~= "" then
+        exe = exe:gsub("%.[Ee][Xx][Ee]$", "")
+        obs.script_log(obs.LOG_INFO, "Recording Organizer: Extracted executable (bracket): '" .. exe .. "'")
+        return exe
+    end
+
+    -- Trailing colon-segment form: "Battlefield 6:Battlefield 6:bf6.exe"
+    exe = window_string:match(":([^:]+%.[Ee][Xx][Ee])$")
+    if exe and exe ~= "" then
+        exe = exe:gsub("%.[Ee][Xx][Ee]$", "")
+        obs.script_log(obs.LOG_INFO, "Recording Organizer: Extracted executable (colon-tail): '" .. exe .. "'")
+        return exe
+    end
+
+    obs.script_log(obs.LOG_INFO, "Recording Organizer: No executable name found in window string")
+    return nil
+end
+
+function clean_exe(exe)
+    -- Minimal cleaning for an executable name being appended to a folder name
+    -- Avoid the full sanitize_folder_name() path (it converts underscores to spaces)
+    if not exe or exe == "" then
+        return ""
+    end
+
+    local cleaned = exe
+
+    if strict_ascii then
+        cleaned = cleaned:gsub("[\128-\255]", "")
+    end
+
+    -- Strip Windows-invalid filename characters (don't replace with _, just remove)
+    local invalid_chars = {"<", ">", ":", '"', "/", "\\", "|", "?", "*"}
+    for _, char in ipairs(invalid_chars) do
+        cleaned = cleaned:gsub("%"..char, "")
+    end
+
+    return cleaned
 end
 
 function sanitize_folder_name(name)
@@ -569,6 +712,12 @@ function sanitize_folder_name(name)
     -- Remove multiple consecutive spaces
     cleaned = cleaned:gsub("%s+", " ")
     
+    -- Strip non-ASCII characters to avoid encoding issues on Windows (mojibake)
+    if strict_ascii then
+        cleaned = cleaned:gsub("[\128-\255]", "")
+        obs.script_log(obs.LOG_INFO, "Recording Organizer: After ASCII strip: '" .. cleaned .. "'")
+    end
+
     -- Characters not allowed in Windows folder names
     local invalid_chars = {"<", ">", ":", '"', "/", "\\", "|", "?", "*"}
     for _, char in ipairs(invalid_chars) do
